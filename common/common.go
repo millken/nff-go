@@ -132,6 +132,7 @@ const (
 	PcapWriteFail
 	InvalidCPURangeErr
 	SetAffinityErr
+	DoubleReceivePort
 )
 
 // NFError is error type returned by nff-go functions

@@ -96,17 +96,17 @@ type Kni struct {
 }
 
 type receiveParameters struct {
-	out   *low.Ring
-	queue int16
-	port  uint8
+	out  *low.Ring
+	port *low.Port
+	kni  bool
 }
 
-func addReceiver(port uint8, queue int16, out *low.Ring) {
+func addReceiver(kni bool, port uint8, out *low.Ring) {
 	par := new(receiveParameters)
-	par.port = port
-	par.queue = queue
+	par.port = low.GetPort(port)
 	par.out = out
-	schedState.addFF("receiver", receive, nil, par, nil, nil, other)
+	par.kni = kni
+	schedState.addFF("receiver", nil, receive, nil, par, nil, nil, recv)
 }
 
 type generateParameters struct {
@@ -121,7 +121,7 @@ func addGenerator(out *low.Ring, generateFunction GenerateFunction) {
 	par := new(generateParameters)
 	par.out = out
 	par.generateFunction = generateFunction
-	schedState.addFF("generator", generateOne, nil, par, nil, nil, other)
+	schedState.addFF("generator", generateOne, nil, nil, par, nil, nil, other)
 }
 
 func addFastGenerator(out *low.Ring, generateFunction GenerateFunction,
@@ -132,7 +132,7 @@ func addFastGenerator(out *low.Ring, generateFunction GenerateFunction,
 	par.mempool = low.CreateMempool()
 	par.vectorGenerateFunction = vectorGenerateFunction
 	par.targetSpeed = float64(targetSpeed)
-	schedState.addFF("fast generator", nil, generatePerf, par, make(chan uint64, 50), context, fastGenerate)
+	schedState.addFF("fast generator", nil, nil, generatePerf, par, make(chan uint64, 50), context, fastGenerate)
 }
 
 type sendParameters struct {
@@ -146,7 +146,7 @@ func addSender(port uint8, queue int16, in *low.Ring) {
 	par.port = port
 	par.queue = queue
 	par.in = in
-	schedState.addFF("sender", send, nil, par, nil, nil, other)
+	schedState.addFF("sender", nil, send, nil, par, nil, nil, tSend)
 }
 
 type copyParameters struct {
@@ -162,7 +162,7 @@ func addCopier(in *low.Ring, out *low.Ring, outCopy *low.Ring) {
 	par.out = out
 	par.outCopy = outCopy
 	par.mempool = low.CreateMempool()
-	schedState.addFF("copy", nil, pcopy, par, make(chan uint64, 50), nil, handleSplitSeparateCopy)
+	schedState.addFF("copy", nil, nil, pcopy, par, make(chan uint64, 50), nil, handleSplitSeparateCopy)
 }
 
 type partitionParameters struct {
@@ -180,7 +180,7 @@ func addPartitioner(in *low.Ring, outFirst *low.Ring, outSecond *low.Ring, N uin
 	par.outSecond = outSecond
 	par.N = N
 	par.M = M
-	schedState.addFF("partitioner", partition, nil, par, nil, nil, other)
+	schedState.addFF("partitioner", partition, nil, nil, par, nil, nil, other)
 }
 
 type separateParameters struct {
@@ -200,7 +200,7 @@ func addSeparator(in *low.Ring, outTrue *low.Ring, outFalse *low.Ring,
 	par.outFalse = outFalse
 	par.separateFunction = separateFunction
 	par.vectorSeparateFunction = vectorSeparateFunction
-	schedState.addFF(name, nil, separate, par, make(chan uint64, 50), context, handleSplitSeparateCopy)
+	schedState.addFF(name, nil, nil, separate, par, make(chan uint64, 50), context, handleSplitSeparateCopy)
 }
 
 type splitParameters struct {
@@ -217,7 +217,7 @@ func addSplitter(in *low.Ring, outs []*low.Ring,
 	par.outs = outs
 	par.splitFunction = splitFunction
 	par.flowNumber = flowNumber
-	schedState.addFF("splitter", nil, split, par, make(chan uint64, 50), context, handleSplitSeparateCopy)
+	schedState.addFF("splitter", nil, nil, split, par, make(chan uint64, 50), context, handleSplitSeparateCopy)
 }
 
 type handleParameters struct {
@@ -235,7 +235,7 @@ func addHandler(in *low.Ring, out *low.Ring,
 	par.out = out
 	par.handleFunction = handleFunction
 	par.vectorHandleFunction = vectorHandleFunction
-	schedState.addFF(name, nil, handle, par, make(chan uint64, 50), context, handleSplitSeparateCopy)
+	schedState.addFF(name, nil, nil, handle, par, make(chan uint64, 50), context, handleSplitSeparateCopy)
 }
 
 type writeParameters struct {
@@ -247,7 +247,7 @@ func addWriter(filename string, in *low.Ring) {
 	par := new(writeParameters)
 	par.in = in
 	par.filename = filename
-	schedState.addFF("writer", write, nil, par, nil, nil, other)
+	schedState.addFF("writer", write, nil, nil, par, nil, nil, other)
 }
 
 type readParameters struct {
@@ -261,7 +261,7 @@ func addReader(filename string, out *low.Ring, repcount int32) {
 	par.out = out
 	par.filename = filename
 	par.repcount = repcount
-	schedState.addFF("reader", read, nil, par, nil, nil, other)
+	schedState.addFF("reader", read, nil, nil, par, nil, nil, other)
 }
 
 var burstSize uint
@@ -270,19 +270,11 @@ var schedTime uint
 var hwtxchecksum bool
 
 type port struct {
-	rxQueues       []bool
-	txQueues       []bool
-	config         int
-	rxQueuesNumber int16
+	wasRequested   bool
 	txQueuesNumber int16
+	willReceive    bool
 	port           uint8
 }
-
-// Flow port types
-const (
-	inactivePort = iota
-	autoPort
-)
 
 // Config is a struct with all parameters, which user can pass to NFF-GO library
 type Config struct {
@@ -416,7 +408,6 @@ func SystemInit(args *Config) error {
 	createdPorts = make([]port, low.GetPortsNumber(), low.GetPortsNumber())
 	for i := range createdPorts {
 		createdPorts[i].port = uint8(i)
-		createdPorts[i].config = inactivePort
 	}
 	// Init scheduler
 	common.LogTitle(common.Initialization, "------------***------ Initializing scheduler -----***------------")
@@ -436,13 +427,13 @@ func SystemInit(args *Config) error {
 // Function can panic during execution.
 func SystemStart() error {
 	common.LogTitle(common.Initialization, "------------***--------- Checking system ---------***------------")
-	if err := checkSystem(); err != nil {
-		return err
+	if openFlowsNumber != 0 {
+		return common.WrapWithNFError(nil, "Some flows are left open at the end of configuration!", common.OpenedFlowAtTheEnd)
 	}
 	common.LogTitle(common.Initialization, "------------***---------- Creating ports ---------***------------")
 	for i := range createdPorts {
-		if createdPorts[i].config != inactivePort {
-			if err := low.CreatePort(createdPorts[i].port, uint16(createdPorts[i].rxQueuesNumber),
+		if createdPorts[i].wasRequested {
+			if err := low.CreatePort(createdPorts[i].port, createdPorts[i].willReceive,
 				uint16(createdPorts[i].txQueuesNumber), hwtxchecksum); err != nil {
 				return err
 			}
@@ -506,14 +497,16 @@ func SetReceiver(port uint8) (OUT *Flow, err error) {
 	if port >= uint8(len(createdPorts)) {
 		return nil, common.WrapWithNFError(nil, "Requested receive port exceeds number of ports which can be used by DPDK (bind to DPDK).", common.ReqTooManyPorts)
 	}
-	createdPorts[port].config = autoPort
-	createdPorts[port].rxQueues = append(createdPorts[port].rxQueues, true)
+	if createdPorts[port].willReceive {
+		return nil, common.WrapWithNFError(nil, "Requested receive port was already set to receive. Two receives from one port are prohibited.", common.DoubleReceivePort)
+	}
+	createdPorts[port].wasRequested = true
+	createdPorts[port].willReceive = true
 	ring := low.CreateRing(generateRingName(), burstSize*sizeMultiplier)
-	addReceiver(port, createdPorts[port].rxQueuesNumber, ring)
+	addReceiver(false, port, ring)
 	OUT = new(Flow)
 	OUT.current = ring
 	openFlowsNumber++
-	createdPorts[port].rxQueuesNumber++
 	return OUT, nil
 }
 
@@ -524,7 +517,7 @@ func SetReceiver(port uint8) (OUT *Flow, err error) {
 // Function can panic during execution.
 func SetReceiverKNI(kni *Kni) (OUT *Flow) {
 	ring := low.CreateRing(generateRingName(), burstSize*sizeMultiplier)
-	addReceiver(kni.port, -1, ring)
+	addReceiver(true, kni.port, ring)
 	OUT = new(Flow)
 	OUT.current = ring
 	openFlowsNumber++
@@ -593,8 +586,7 @@ func SetSender(IN *Flow, port uint8) error {
 	if port >= uint8(len(createdPorts)) {
 		return common.WrapWithNFError(nil, "Requested send port exceeds number of ports which can be used by DPDK (bind to DPDK).", common.ReqTooManyPorts)
 	}
-	createdPorts[port].config = autoPort
-	createdPorts[port].txQueues = append(createdPorts[port].txQueues, true)
+	createdPorts[port].wasRequested = true
 	addSender(port, createdPorts[port].txQueuesNumber, IN.current)
 	createdPorts[port].txQueuesNumber++
 	IN.current = nil
@@ -818,19 +810,19 @@ func GetPortMACAddress(port uint8) [common.EtherAddrLen]uint8 {
 	return low.GetPortMACAddress(port)
 }
 
-func receive(parameters interface{}, coreID int) {
+func receive(parameters interface{}, flag *int, coreID int) {
 	srp := parameters.(*receiveParameters)
-	low.Receive(srp.port, srp.queue, srp.out, coreID)
+	if srp.kni {
+		low.Receive(uint8(srp.port.Port), -1, srp.out, flag, coreID)
+	} else {
+		low.Receive(uint8(srp.port.Port), int16(srp.port.N-1), srp.out, flag, coreID)
+	}
 }
 
-func generateOne(parameters interface{}, core int) {
+func generateOne(parameters interface{}) {
 	gp := parameters.(*generateParameters)
 	OUT := gp.out
 	generateFunction := gp.generateFunction
-	if err := low.SetAffinity(core); err != nil {
-		common.LogFatal(common.Debug, "Failed to set affinity to", core, "core: ", err)
-	}
-
 	for {
 		tempPacket, err := packet.NewPacket()
 		if err != nil {
@@ -958,7 +950,7 @@ func pcopy(parameters interface{}, stopper chan int, report chan uint64, context
 	}
 }
 
-func send(parameters interface{}, coreID int) {
+func send(parameters interface{}, flag *int, coreID int) {
 	srp := parameters.(*sendParameters)
 	low.Send(srp.port, srp.queue, srp.in, coreID)
 }
@@ -1111,17 +1103,13 @@ func separate(parameters interface{}, stopper chan int, report chan uint64, cont
 	}
 }
 
-func partition(parameters interface{}, core int) {
+func partition(parameters interface{}) {
 	cp := parameters.(*partitionParameters)
 	IN := cp.in
 	OUTFirst := cp.outFirst
 	OUTSecond := cp.outSecond
 	N := cp.N
 	M := cp.M
-
-	if err := low.SetAffinity(core); err != nil {
-		common.LogFatal(common.Debug, "Failed to set affinity to", core, "core: ", err)
-	}
 
 	bufsIn := make([]uintptr, burstSize)
 	bufsFirst := make([]uintptr, burstSize)
@@ -1291,7 +1279,7 @@ func handle(parameters interface{}, stopper chan int, report chan uint64, contex
 	}
 }
 
-func write(parameters interface{}, coreID int) {
+func write(parameters interface{}) {
 	wp := parameters.(*writeParameters)
 	IN := wp.in
 	filename := wp.filename
@@ -1323,7 +1311,7 @@ func write(parameters interface{}, coreID int) {
 	}
 }
 
-func read(parameters interface{}, coreID int) {
+func read(parameters interface{}) {
 	rp := parameters.(*readParameters)
 	OUT := rp.out
 	filename := rp.filename
@@ -1404,31 +1392,6 @@ func checkFlow(f *Flow) error {
 	}
 	if f.current == nil {
 		return common.WrapWithNFError(nil, "One of the flows is used after it was closed!", common.UseClosedFlowErr)
-	}
-	return nil
-}
-
-func checkSystem() error {
-	if openFlowsNumber != 0 {
-		return common.WrapWithNFError(nil, "Some flows are left open at the end of configuration!", common.OpenedFlowAtTheEnd)
-	}
-	for i := range createdPorts {
-		if createdPorts[i].config == inactivePort {
-			continue
-		}
-		if createdPorts[i].rxQueuesNumber == 0 && createdPorts[i].txQueuesNumber == 0 {
-			return common.WrapWithNFError(nil, "port has no send and receive queues. It is an error in DPDK.", common.PortHasNoQueues)
-		}
-		for j := range createdPorts[i].rxQueues {
-			if createdPorts[i].rxQueues[j] != true {
-				return common.WrapWithNFError(nil, "port doesn't use all receive queues, packets can be missed due to RSS!", common.NotAllQueuesUsed)
-			}
-		}
-		for j := range createdPorts[i].txQueues {
-			if createdPorts[i].txQueues[j] != true {
-				return common.WrapWithNFError(nil, "port has unused send queue. Performance can be lower than it is expected!", common.NotAllQueuesUsed)
-			}
-		}
 	}
 	return nil
 }

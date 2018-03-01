@@ -23,6 +23,7 @@ const generatePauseStep = 0.1
 type clonePair struct {
 	index   int
 	channel chan int
+	flag    int
 }
 
 // UserContext is used inside flow packet and is going for user via it
@@ -32,14 +33,17 @@ type UserContext interface {
 }
 
 // Function types which are used inside flow functions
-type uncloneFlowFunction func(interface{}, int)
+type uncloneFlowFunction func(interface{})
 type cloneFlowFunction func(interface{}, chan int, chan uint64, UserContext)
+type CFlowFunction func(interface{}, *int, int)
 
 type ffType int
 
 const (
 	handleSplitSeparateCopy ffType = iota
 	fastGenerate
+	recv
+	tSend
 	other
 )
 
@@ -49,6 +53,8 @@ type flowFunction struct {
 	Parameters interface{}
 	// Main body of unclonable flow function
 	uncloneFunction uncloneFlowFunction
+	// Main body of receive flow function
+	cFunction CFlowFunction
 	// Main body of clonable flow function
 	cloneFunction cloneFlowFunction
 	// Pause channel of function itself (not clones)
@@ -74,12 +80,13 @@ type flowFunction struct {
 }
 
 // Adding every flow function to scheduler list
-func (scheduler *scheduler) addFF(name string, ucfn uncloneFlowFunction, cfn cloneFlowFunction,
+func (scheduler *scheduler) addFF(name string, ucfn uncloneFlowFunction, Cfn CFlowFunction, cfn cloneFlowFunction,
 	par interface{}, report chan uint64, context UserContext, fType ffType) {
 	ff := new(flowFunction)
 	scheduler.ffCount++
 	ff.name = name + " " + strconv.Itoa(scheduler.ffCount)
 	ff.uncloneFunction = ucfn
+	ff.cFunction = Cfn
 	ff.cloneFunction = cfn
 	ff.Parameters = par
 	ff.report = report
@@ -163,25 +170,29 @@ func (scheduler *scheduler) systemStart() (err error) {
 
 func (scheduler *scheduler) startFF(ff *flowFunction, core int) (err error) {
 	common.LogDebug(common.Initialization, "Start FlowFunction", ff.name, "at", core, "core")
-	switch ff.fType {
-	case handleSplitSeparateCopy:
-	case fastGenerate:
-		go func() {
+	a := int(1)
+	if ff.fType == recv {
+		low.IncreaseRSS((ff.Parameters.(*receiveParameters)).port)
+	}
+	go func() {
+		if ff.fType != recv && ff.fType != tSend {
 			if err := low.SetAffinity(core); err != nil {
 				common.LogFatal(common.Initialization, "Failed to set affinity to", core, "core: ", err)
 			}
-			ff.channel = make(chan int)
-			if ff.context != nil {
-				ff.cloneFunction(ff.Parameters, ff.channel, ff.report, (ff.context.Copy()).(UserContext))
+			if ff.fType == handleSplitSeparateCopy || ff.fType == fastGenerate {
+				ff.channel = make(chan int)
+				if ff.context != nil {
+					ff.cloneFunction(ff.Parameters, ff.channel, ff.report, (ff.context.Copy()).(UserContext))
+				} else {
+					ff.cloneFunction(ff.Parameters, ff.channel, ff.report, nil)
+				}
 			} else {
-				ff.cloneFunction(ff.Parameters, ff.channel, ff.report, nil)
+				ff.uncloneFunction(ff.Parameters)
 			}
-		}()
-	case other:
-		go func() {
-			ff.uncloneFunction(ff.Parameters, core)
-		}()
-	}
+		} else {
+			ff.cFunction(ff.Parameters, &a, core)
+		}
+	}()
 	return nil
 }
 
@@ -256,7 +267,13 @@ func (scheduler *scheduler) schedule(schedTime uint) {
 							}
 						}
 					}
+				case recv:
+					if low.FullRSS(ff.Parameters.(*receiveParameters).port) == -1 {
+						scheduler.removeClone(ff)
+						low.DecreaseRSS((ff.Parameters.(*receiveParameters)).port)
+					}
 				case other:
+				case tSend:
 				}
 			}
 			// Secondly we check adding clones. We can add one clone if:
@@ -299,7 +316,13 @@ func (scheduler *scheduler) schedule(schedTime uint) {
 							continue
 						}
 					}
+				case recv:
+					if low.FullRSS(ff.Parameters.(*receiveParameters).port) == 1 {
+						low.IncreaseRSS((ff.Parameters.(*receiveParameters)).port)
+						scheduler.startClone(ff)
+					}
 				case other:
+				case tSend:
 				}
 			}
 		}
@@ -316,26 +339,37 @@ func (scheduler *scheduler) startClone(ff *flowFunction) bool {
 	}
 	core := scheduler.cores[index].id
 	cp := new(clonePair)
-	cp.channel = make(chan int)
 	cp.index = index
+	if ff.report != nil {
+		cp.channel = make(chan int)
+	}
+	cp.flag = 1
 	ff.clone = append(ff.clone, cp)
 	ff.cloneNumber++
 	go func() {
-		err := low.SetAffinity(core)
-		if err != nil {
-			common.LogFatal(common.Debug, "Failed to set affinity to", core, "core: ", err)
-		}
-		if ff.context != nil {
-			ff.cloneFunction(ff.Parameters, cp.channel, ff.report, (ff.context.Copy()).(UserContext))
+		if ff.report != nil {
+			err := low.SetAffinity(core)
+			if err != nil {
+				common.LogFatal(common.Debug, "Failed to set affinity to", core, "core: ", err)
+			}
+			if ff.context != nil {
+				ff.cloneFunction(ff.Parameters, cp.channel, ff.report, (ff.context.Copy()).(UserContext))
+			} else {
+				ff.cloneFunction(ff.Parameters, cp.channel, ff.report, nil)
+			}
 		} else {
-			ff.cloneFunction(ff.Parameters, cp.channel, ff.report, nil)
+			ff.cFunction(ff.Parameters, &cp.flag, core)
 		}
 	}()
 	return true
 }
 
 func (scheduler *scheduler) removeClone(ff *flowFunction) {
-	ff.clone[ff.cloneNumber-1].channel <- -1
+	if ff.clone[ff.cloneNumber-1].channel != nil {
+		ff.clone[ff.cloneNumber-1].channel <- -1
+	} else {
+		ff.clone[ff.cloneNumber-1].flag = 0
+	}
 	scheduler.setCoreByIndex(ff.clone[ff.cloneNumber-1].index)
 	ff.clone = ff.clone[:len(ff.clone)-1]
 	ff.cloneNumber--
@@ -360,6 +394,7 @@ func (ff *flowFunction) printDebug(schedTime uint) {
 		speedPKTS := convertPKTS(ff.currentSpeed, schedTime)
 		common.LogDebug(common.Debug, "Current speed of", ff.name, "is", speedPKTS, "PKT/S, target speed is", int64(targetSpeed), "PKT/S")
 	case other:
+	case tSend:
 	}
 }
 

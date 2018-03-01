@@ -67,6 +67,11 @@ static int kni_config_network_interface(uint8_t port_id, uint8_t if_up);
 
 uint32_t BURST_SIZE;
 
+struct sport {
+	uint8_t Port;
+	uint8_t N;
+};
+
 void initCPUSet(int coreId, cpu_set_t* cpuset) {
 	CPU_ZERO(cpuset);
 	CPU_SET(coreId, cpuset);
@@ -106,11 +111,63 @@ void create_kni(uint8_t port, uint8_t core, char *name, struct rte_mempool *mbuf
 	}
 }
 
+int fullRSS(struct sport *port) {
+	int z = 0;
+	for (int i = 0; i < 5; i++) {
+		z += rte_eth_rx_queue_count(port->Port, port->N-1);
+	}
+	z = z / 5;
+	if (z < 5) {
+		return -1;
+	} else if (z < 50) {
+		return 0;
+	}
+	return 1;
+}
+
+void changeRSSReta(struct sport *port, bool increment) {
+	struct rte_eth_dev_info dev_info;
+	memset(&dev_info, 0, sizeof(dev_info));
+	rte_eth_dev_info_get(port->Port, &dev_info);
+
+	struct rte_eth_rss_reta_entry64 reta_conf[8];
+	memset(reta_conf, 0, sizeof(reta_conf));
+
+        rte_eth_dev_rss_reta_query(port->Port, reta_conf, dev_info.reta_size);
+
+        // This is required, it is hang without this
+        for (int i = 0; i < 8; i++) {
+                reta_conf[i].mask = UINT64_MAX;
+        }
+
+	if (increment) {
+		port->N++;
+	} else {
+		port->N--;
+		if (port->N == 0) {
+			return;
+		}
+	}
+	// http://dpdk.org/doc/api/examples_2ip_pipeline_2init_8c-example.html#a27
+        for (int i = 0; i < 8; i++) {
+                for (int j = 0; j < 64 /*reta_size/8*/; j++) {
+                        reta_conf[i].reta[j] = j % port->N;
+                }
+        }
+        rte_eth_dev_rss_reta_update(port->Port, reta_conf, dev_info.reta_size);
+//      rte_eth_dev_rx_queue_start(port->Port, port->N - 1);
+//      rte_eth_dev_rx_queue_stop(port->Port, port->N);
+}
+
 // Initializes a given port using global settings and with the RX buffers
 // coming from the mbuf_pool passed as a parameter.
-int port_init(uint8_t port, uint16_t receiveQueuesNumber, uint16_t sendQueuesNumber, struct rte_mempool *mbuf_pool,
-    struct ether_addr* addr, bool hwtxchecksum) {
-	const uint16_t rx_rings = receiveQueuesNumber, tx_rings = sendQueuesNumber;
+int port_init(uint8_t port, bool willReceive, uint16_t sendQueuesNumber, struct rte_mempool *mbuf_pool, struct ether_addr* addr, bool hwtxchecksum) {
+	uint16_t rx_rings, tx_rings = sendQueuesNumber;
+	if (willReceive) {
+		rx_rings = 16;
+	} else {
+		rx_rings = 0;
+	}
 	int retval;
 	uint16_t q;
 
@@ -165,6 +222,19 @@ int port_init(uint8_t port, uint16_t receiveQueuesNumber, uint16_t sendQueuesNum
 	/* Enable RX in promiscuous mode for the Ethernet device. */
 	rte_eth_promiscuous_enable(port);
 
+	// We make it not to use
+	// struct rte_eth_rxconf rx_conf = {
+	//     .rx_deferred_start = 0
+	// };
+	// and get points from using default configuration
+	struct sport newPort = {
+		.Port  = port,
+		.N = rx_rings
+	};
+        for (q = 0; q < rx_rings; q++) {
+                changeRSSReta(&newPort, false);
+        }
+
 	return 0;
 }
 
@@ -212,7 +282,7 @@ struct rte_mbuf* reassemble(struct rte_ip_frag_tbl* tbl, struct rte_mbuf *buf, s
 	return buf;
 }
 
-void nff_go_recv(uint8_t port, int16_t queue, struct rte_ring *out_ring, int coreId) {
+void nff_go_recv(uint8_t port, int16_t queue, struct rte_ring *out_ring, volatile int *flag, int coreId) {
 	setAffinity(coreId);
 
 	struct rte_mbuf *bufs[BURST_SIZE];
@@ -226,7 +296,7 @@ void nff_go_recv(uint8_t port, int16_t queue, struct rte_ring *out_ring, int cor
 	struct rte_mbuf *temp;
 #endif
 	// Run until the application is quit. Recv can't be stopped now.
-	for (;;) {
+	while (*flag == 1) {
 		// Get RX packets from port
 		if (queue != -1) {
 			rx_pkts_number = rte_eth_rx_burst(port, queue, bufs, BURST_SIZE);

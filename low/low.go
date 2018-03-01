@@ -40,9 +40,32 @@ type Mbuf C.struct_rte_mbuf
 // Mempool is a pool of objects.
 type Mempool C.struct_rte_mempool
 
+type Port C.struct_sport
+
 var mbufNumberT uint
 var mbufCacheSizeT uint
 var usedMempools []*C.struct_rte_mempool
+
+func GetPort(n uint8) *Port {
+	p := new(Port)
+	p.Port = C.uint8_t(n)
+	p.N = 0
+	return p
+}
+
+func FullRSS(p *Port) int {
+	q := int(C.fullRSS((*C.struct_sport)(p)))
+	print(q)
+	return q
+}
+
+func DecreaseRSS(p *Port) {
+	C.changeRSSReta((*C.struct_sport)(p), false)
+}
+
+func IncreaseRSS(p *Port) {
+	C.changeRSSReta((*C.struct_sport)(p), true)
+}
 
 // GetPortMACAddress gets MAC address of given port.
 func GetPortMACAddress(port uint8) [common.EtherAddrLen]uint8 {
@@ -430,12 +453,14 @@ func (ring *Ring) GetRingCount() uint32 {
 }
 
 // Receive - get packets and enqueue on a Ring.
-func Receive(port uint8, queue int16, OUT *Ring, coreID int) {
+func Receive(port uint8, queue int16, OUT *Ring, flag *int, coreID int) {
 	t := C.rte_eth_dev_socket_id(C.uint8_t(port))
 	if t != C.int(C.rte_lcore_to_socket_id(C.uint(coreID))) {
 		common.LogWarning(common.Initialization, "Receive port", port, "is on remote NUMA node to polling thread - not optimal performance.")
 	}
-	C.nff_go_recv(C.uint8_t(port), C.int16_t(queue), OUT.DPDK_ring, C.int(coreID))
+	go func() {
+		C.nff_go_recv(C.uint8_t(port), C.int16_t(queue), OUT.DPDK_ring, (*C.int)(unsafe.Pointer(flag)), C.int(coreID))
+	}()
 }
 
 // Send - dequeue packets and send.
@@ -479,16 +504,16 @@ func GetPortsNumber() int {
 }
 
 // CreatePort initializes a new port using global settings and parameters.
-func CreatePort(port uint8, receiveQueuesNumber uint16, sendQueuesNumber uint16, hwtxchecksum bool) error {
+func CreatePort(port uint8, willReceive bool, sendQueuesNumber uint16, hwtxchecksum bool) error {
 	addr := make([]byte, C.ETHER_ADDR_LEN)
 	var mempool *C.struct_rte_mempool
-	if receiveQueuesNumber != 0 {
+	if willReceive {
 		mempool = C.createMempool(C.uint32_t(mbufNumberT), C.uint32_t(mbufCacheSizeT))
 		usedMempools = append(usedMempools, mempool)
 	} else {
 		mempool = nil
 	}
-	if C.port_init(C.uint8_t(port), C.uint16_t(receiveQueuesNumber), C.uint16_t(sendQueuesNumber),
+	if C.port_init(C.uint8_t(port), C.bool(willReceive), C.uint16_t(sendQueuesNumber),
 		mempool, (*C.struct_ether_addr)(unsafe.Pointer(&(addr[0]))), C._Bool(hwtxchecksum)) != 0 {
 		msg := common.LogError(common.Initialization, "Cannot init port ", port, "!")
 		return common.WrapWithNFError(nil, msg, common.FailToInitPort)
